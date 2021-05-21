@@ -173,7 +173,7 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
     return AE_OK;
 }
 ```
-我们从监听socket开始看文件事件模型，首先redis根据配置监听端口（bind、listen、设置非阻塞属性等）调用`createSocketAcceptHandler`创建文件事件注册读取回调函数`acceptTcpHandler`，处理客户端tcp连接，在有socket链接上来调用注册的`acceptTcpHandler`回调函数获取fd，使用fd创建一个（todo：con）`connection`的结构体（其实有cpp对象的味道），然后创建client结构体（todo：client），`connection`结构体中有读取回调，写回调等，设置回调函数就会生成fileEvent注册到事件循环中，当事件发生就会调用对应的回调函数，例如redis-cli链接上来，生成client对象会设置`connection`的读取回调，注册回调函数`readQueryFromClient`，当有读取事件发生，将会调用`readQueryFromClient`函数进行处理。
+我们从监听socket开始看文件事件模型，首先redis根据配置监听端口（bind、listen、设置非阻塞属性等）调用`createSocketAcceptHandler`创建文件事件注册读取回调函数`acceptTcpHandler`，处理客户端tcp连接，在有socket链接上来调用注册的`acceptTcpHandler`回调函数获取fd，使用fd创建一个[connection](#connection)的结构体（其实有cpp对象的味道），然后创建client结构体（todo：client），`connection`结构体中有读取回调，写回调等，设置回调函数就会生成fileEvent注册到事件循环中，当事件发生就会调用对应的回调函数，例如redis-cli链接上来，生成client对象会设置`connection`的读取回调，注册回调函数`readQueryFromClient`，当有读取事件发生，将会调用`readQueryFromClient`函数进行处理。
 ## 时间事件
 时间事件与文件事件比较类似
 ```
@@ -203,3 +203,37 @@ int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id);
 `prev` `next` 时间事件为双向链表，head存储在`aeEventLoop`  
 `refcount` 防止在递归时间事件调用中释放计时器事件  
 时间事件处理比较简单，遍历事件循环中的时间事件列表，如果当前时间事件id为-1，且为非递归，从链表中删除，并调用`finalizerProc`，若果当前时间事件id不为-1，且小于等于now时间，则调用`timeProc`，调用前`refcount++`，调用前`refcount--`，根据回调函数返回值判断此事件是一次性timer还是持续timer，若不为-1则增加`when`，否则id改为-1，惰性删除。
+
+## connection
+```
+typedef struct ConnectionType {
+    void (*ae_handler)(struct aeEventLoop *el, int fd, void *clientData, int mask);
+    int (*connect)(struct connection *conn, const char *addr, int port, const char *source_addr, ConnectionCallbackFunc connect_handler);
+    int (*write)(struct connection *conn, const void *data, size_t data_len);
+    int (*read)(struct connection *conn, void *buf, size_t buf_len);
+    void (*close)(struct connection *conn);
+    int (*accept)(struct connection *conn, ConnectionCallbackFunc accept_handler);
+    int (*set_write_handler)(struct connection *conn, ConnectionCallbackFunc handler, int barrier);
+    int (*set_read_handler)(struct connection *conn, ConnectionCallbackFunc handler);
+} ConnectionType;
+
+struct connection {
+    ConnectionType *type;
+    ConnectionState state;
+    short int flags;
+    short int refs;
+    int last_errno;
+    void *private_data;
+    ConnectionCallbackFunc conn_handler;
+    ConnectionCallbackFunc write_handler;
+    ConnectionCallbackFunc read_handler;
+    int fd;
+};
+```
+可以把`connection`看成一个对象`ConnectionType`便是它的成员函数，type是默认的CT_Socket  
+`ae_handler` 注册到事件循环中的任何事件的回调函数都是它，在这个函数中对事件进行区分再次调用`ConnectionCallbackFunc`函数来真正的读或者写。需要明白的是与事件处理循环中相同，对单个fd，当有事件触发时会在事件循环中对读或写进行分开处理，但是普遍情况下我们的注册回调函数都是此函数，因此在这个函数中也有读或写的分开处理，自然也有循环处理中的`WRITE_BARRIER`    
+`set_write_handler``set_read_handler` 即为注册文件事件循环，分别注册读和写  
+其他的函数其实都对应着相应的系统调用，因此可以看出connection其实就是对tcp的操作的封装
+
+## 总结
+redis的事件模型是封装了多个多路复用的框架，整个框架小巧精致，其中对于很多都充满了面向对象的味道，还有很多小细节没有分析到，后面分析集群还会根据过程管理参数不同进行再次分析。
