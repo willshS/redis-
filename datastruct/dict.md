@@ -295,3 +295,15 @@ int dictRehash(dict *d, int n) {
 }
 ```
 注释：参数n，为移动n个桶后返回。因为是渐进式rehash，所以不能将全部元素直接移动到新的哈希表中，而且哈希表中可能有过多的空桶，为了防止访问太多桶而造成长时间的阻塞，访问空桶数量最大为n*10。每次rehash，将一个桶中的所有元素重新计算在新的哈希表中的idx，然后移动过去，修改rehashidx和used。保证其他操作不受影响。
+rehash操作在增删查等操作中都会进行移动一个桶的操作，直至rehash结束
+### 迭代器
+```
+dictIterator *dictGetIterator(dict *d);
+dictIterator *dictGetSafeIterator(dict *d);
+```
+dict提供了两种迭代器，一种是安全的，一种是不安全的。  
+不安全的迭代器：迭代过程中，若果rehash，rehash可能导致迭代器跳过很多元素，或重复访问某些元素。因此不安全的迭代器只能进行遍历，不能进行哈希表的操作。在初始化不安全的迭代器时，会将哈希表的状态xor异或生成一个“指纹”，析构的时候会检查“指纹”是否相同，若不同就说明用户在迭代过程中做了哈希表的操作如add，delete等。  
+安全的迭代器：初始化安全的迭代器会将哈希表的rehash暂停。此时就可以做任何哈希操作而不安全了。(迭代器中存储当前遍历的元素entry和当前元素的下一个nextEntry来保证删除操作不会越界，删除当前元素entry，下次迭代会将nextEntry赋值给entry，若为空，则继续循环下个桶。但是如果我在迭代到entry时，恰巧将nextEntry给删除了，就会访问越界，**因此循环时请仅使用当前entry**)
+
+## 总结
+dict通过使用两张哈希表来实现渐进式哈希，通过组合used，size，rehashidx来实现各种功能，并提供暂停哈希功能。通过使用uion存储v进行优化某些元素的存储，sizemask优化速度，rehashidx保证rehash逐步进行保证性能不会被block。并且提供dicttype可以让用户灵活定制自己的哈希表。
