@@ -232,7 +232,7 @@ unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dic
     return removed;
 }
 ```
-其他范围删除的函数与以score范围删除基本相同。  
+更新以及其他范围删除的函数与以score范围删除基本相同。  
 ## 总结
 跳表主要点就在随机层数和插入删除，其余操作与插入基本相同，redis的跳表比实际意义的跳表多了span，可以方便的进行范围操作。  
 作者多次强调调用者来保证元素的唯一性，从代码来看是可以插入相同元素的。以下是作者注释:
