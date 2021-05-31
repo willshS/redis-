@@ -32,13 +32,16 @@ redisCommand会事先定义好redis支持的各种命令以及他们的回调函
      0,NULL,1,1,1,0,0,0},
 ```
 首先检查key是否过期，如果过期进行删除。通过lookupKey找到要处理的key，如果找到，则更新他们的lru和lfu，没找到则添加，然后调用对应的数据结构接口对数据进行修改。修改完成后添加回复到客户端。
-`name` set get 等命令字符串
-`proc` 命令处理函数指针
-`arity` 参数数目， -N表示>=N
-`sflags flags` 命令标志，定义了这个命令是什么类型的命令（写，只读，使用内存，随机，脚本，排序等等）
-`getkeys_proc` 从命令中获取键参数的可选函数
-`firstkey lastkey keystep` 第一个参数，最后一个参数，参数的步数，例如mset key,value,key,value 步数是2
-`microseconds` 命令总执行时间
-`calls` 命令调用总数
-`id` 访问控制
+`name` set get 等命令字符串  
+`proc` 命令处理函数指针  
+`arity` 参数数目， -N表示>=N  
+`sflags flags` 命令标志，定义了这个命令是什么类型的命令（写，只读，使用内存，随机，脚本，排序等等）  
+`getkeys_proc` 从命令中获取键参数的可选函数  
+`firstkey lastkey keystep` 第一个参数，最后一个参数，参数的步数，例如mset key,value,key,value 步数是2  
+`microseconds` 命令总执行时间  
+`calls` 命令调用总数  
+`id` 访问控制  
 注：flags、microseconds和calls字段由Redis计算，应该始终设置为零。
+
+## 总结
+redisCommand的处理比较简单，根据不同命令解析出参数，然后对对应的数据结构进行操作即可。加上主从就复杂了很多，访问控制参数就更复杂了。这些后面在慢慢总结
