@@ -4,15 +4,16 @@
 ![radix](./radix.png)
 
 ### radix说明
+radix的路径是降一级的，即h->i->[] h节点表示"", i节点表示"h" []节点表示"hi"。也就是说叶子节点是完整路径，但是可能size==0
 ```
 typedef struct raxNode {
     uint32_t iskey:1;     /* Does this node contain a key? */
     uint32_t isnull:1;    /* Associated value is NULL (don't store it). */
     uint32_t iscompr:1;   /* Node is compressed. */
     uint32_t size:29;     /* Number of children, or compressed string len. */
-    /* 当不压缩的时候，data中有size个子节点
+    /* 当不压缩的时候，data中有size个子节点,即a...或b...或c...三种路径
      * [header iscompr=0][abc][padding][a-ptr][b-ptr][c-ptr](value-ptr?)
-     * 当压缩的时候，data中只有一个子节点
+     * 当压缩的时候，data中只有一个子节点,即xyz...只有一种路径
      * [header iscompr=1][xyz][padding][z-ptr](value-ptr?)
      */
     unsigned char data[]; // 柔性数组
@@ -112,9 +113,11 @@ void *raxGetData(raxNode *n) {
 无论是插入还是删除都需要使用到查找
 ```
 // 此函数查找s，返回停止查找的节点即不匹配的节点，返回值为s匹配的字节数
-// 若返回值为0，则h与s完全不匹配，h可能为空节点，例如第一次插入返回header
-// 若返回值>0,<len,则部分匹配即路径是s的子串，splitpos有值则h为匹配的压缩节点，反之h可能为空节点或完全不匹配的节点（部分匹配肯定会继续遍历，匹配失败自然返回子节点，比如：现在有两个节点h->i,查找ha,h匹配，子节点i（无论是否压缩）不匹配被返回）。
-// 若返回值==len，则完全匹配，返回节点h，此时splitpos有值，则不存在
+// 停止查找两个条件，1.h.size==0即遍历到叶子节点了，2.i==len，即s找到了。
+// 1.h返回可能为叶子节点 2.h返回可能为压缩节点 3.h返回可能为同级节点
+// 1.第一次插入或完全匹配如h->i->[]，查找"hi",返回节点[]
+// 2."helloworld"->[]查找"helloredis"，返回节点"helloworld"并且splitpos==5
+// 3.h->i->[],查找"hello"，返回节点为"i" 
 static inline size_t raxLowWalk(rax *rax, unsigned char *s, size_t len, raxNode **stopnode, raxNode ***plink, int *splitpos, raxStack *ts) {
     raxNode *h = rax->head;
     raxNode **parentlink = &rax->head; // 1? 这个变量好像没有任何作用，一直等于h，而且外部也没有进行使用，根据命名应该是h的父亲？那么后面应该是parentlink = h;memcpy(&h,children+j,sizeof(h));吧
