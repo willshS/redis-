@@ -59,6 +59,7 @@ int expireIfNeeded(redisDb *db, robj *key) {
         dbSyncDelete(db,key);
     }
     server.stat_expiredkeys++;
+    // 通知从删除，并写入aof
     propagateExpire(db,key,server.lazyfree_lazy_expire);
     notifyKeyspaceEvent(NOTIFY_EXPIRED,
         "expired",key,db->id);

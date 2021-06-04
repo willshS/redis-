@@ -382,3 +382,213 @@ void serveClientsBlockedOnListKey(robj *o, readyList *rl) {
 }
 ```
 阻塞的也通知完了，为什么是dbAdd这个时间点通知呢？因为对于redis来说，如果存储的list的长度为0，就将这个key从db的dict中删除，这时候我来blpop，dict中如果存在，就退化成lpop，如果不存在那就block，等别人dbadd进来。从上面的blockingPopGenericCommand也能看到，有数据就直接返回，所有block等待的list都没有数据，才阻塞client。
+#### watched_keys
+服务于watch命令，watch命令是监视一个key，然后可以开始事务，当提交事务的时候，如果监听的key变化了，则事务失败。下面将redis的事务和watch一起看。  
+redis的事务是不具有原子性的，搭配watch可以进行原子性。redis的事务其实仅仅是将命令缓存，提交事务的时候进行执行。
+```
+// watch跟blocking非常相似，client有个监听key的list，db中有某个key的监听client链表. unwatch跟这个相反，不贴了
+void watchForKey(client *c, robj *key) {
+    list *clients = NULL;
+    listIter li;
+    listNode *ln;
+    watchedKey *wk;
+
+    /* Check if we are already watching for this key */
+    listRewind(c->watched_keys,&li);
+    while((ln = listNext(&li))) {
+        wk = listNodeValue(ln);
+        if (wk->db == c->db && equalStringObjects(key,wk->key))
+            return; /* Key already watched */
+    }
+    /* This key is not already watched in this DB. Let's add it */
+    clients = dictFetchValue(c->db->watched_keys,key);
+    if (!clients) {
+        clients = listCreate();
+        dictAdd(c->db->watched_keys,key,clients);
+        incrRefCount(key);
+    }
+    listAddNodeTail(clients,c);
+    /* Add the new key to the list of keys watched by this client */
+    wk = zmalloc(sizeof(*wk));
+    wk->key = key;
+    wk->db = c->db;
+    incrRefCount(key);
+    listAddNodeTail(c->watched_keys,wk);
+}
+
+// 事务开始，给client增加MULTI状态
+void multiCommand(client *c) {
+    if (c->flags & CLIENT_MULTI) {
+        addReplyError(c,"MULTI calls can not be nested");
+        return;
+    }
+    c->flags |= CLIENT_MULTI;
+
+    addReply(c,shared.ok);
+}
+
+// 可以看到事务处理在processCommand最后面，此时已经查找命令了，如果命令错误直接就是事务失败，这里还没有处理数据，所以如果数据错误，事务并不失败
+int processCommand(client *c) {
+    ......
+
+    /* Exec the command */
+    if (c->flags & CLIENT_MULTI &&
+        c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
+        c->cmd->proc != multiCommand && c->cmd->proc != watchCommand &&
+        c->cmd->proc != resetCommand)
+    {
+        // 事务 缓存命令
+        queueMultiCommand(c);
+        addReply(c,shared.queued);
+    } else {
+        // 非事务直接执行
+        call(c,CMD_CALL_FULL);
+        c->woff = server.master_repl_offset;
+        if (listLength(server.ready_keys))
+            handleClientsBlockedOnKeys();
+    }
+    return C_OK;
+}
+
+typedef struct multiState {
+    multiCmd *commands;
+    int count;
+    int cmd_flags;
+    int cmd_inv_flags;
+} multiState;
+
+void queueMultiCommand(client *c) {
+    multiCmd *mc;
+    int j;
+
+    /* 如上所述，如果我们的命令有问题，在回复我们命令出错的同时会给client挂上这个标志，当提交事务的时候，事务中所有语句全都不执行，这里连存都懒得存了 */
+    if (c->flags & CLIENT_DIRTY_EXEC)
+        return;
+    // client中有个事务结构体
+    c->mstate.commands = zrealloc(c->mstate.commands,
+            sizeof(multiCmd)*(c->mstate.count+1));
+    // 找到当前该放command的位置
+    mc = c->mstate.commands+c->mstate.count;
+    // 命令以及参数放好
+    mc->cmd = c->cmd;
+    mc->argc = c->argc;
+    mc->argv = zmalloc(sizeof(robj*)*c->argc);
+    memcpy(mc->argv,c->argv,sizeof(robj*)*c->argc);
+    for (j = 0; j < c->argc; j++)
+        incrRefCount(mc->argv[j]);
+    // 命令数量和flag放好
+    c->mstate.count++;
+    c->mstate.cmd_flags |= c->cmd->flags;
+    c->mstate.cmd_inv_flags |= ~c->cmd->flags;
+}
+
+void execCommand(client *c) {
+    int j;
+    robj **orig_argv;
+    int orig_argc;
+    struct redisCommand *orig_cmd;
+    int was_master = server.masterhost == NULL;
+    // 不是事务 返回
+    if (!(c->flags & CLIENT_MULTI)) {
+        addReplyError(c,"EXEC without MULTI");
+        return;
+    }
+
+    // 如果watch的有改变，或者命令有错误 直接返回
+    // 当有键改变的时候，都会调用`signalModifiedKey`，在此函数中会对watch这个key的client加上dirtycas的标志
+    if (c->flags & (CLIENT_DIRTY_CAS|CLIENT_DIRTY_EXEC)) {
+        addReply(c, c->flags & CLIENT_DIRTY_EXEC ? shared.execaborterr :
+                                                   shared.nullarray[c->resp]);
+        discardTransaction(c);
+        goto handle_monitor;
+    }
+
+    uint64_t old_flags = c->flags;
+
+    /* we do not want to allow blocking commands inside multi */
+    c->flags |= CLIENT_DENY_BLOCKING;
+
+    /* Exec all the queued commands */ 这里为什么不取消浪费cpu？
+    unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
+
+    server.in_exec = 1;
+
+    orig_argv = c->argv;
+    orig_argc = c->argc;
+    orig_cmd = c->cmd;
+    addReplyArrayLen(c,c->mstate.count);
+    for (j = 0; j < c->mstate.count; j++) {
+        c->argc = c->mstate.commands[j].argc;
+        c->argv = c->mstate.commands[j].argv;
+        c->cmd = c->mstate.commands[j].cmd;
+
+        /* 权限控制 */
+        int acl_errpos;
+        int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+        if (acl_retval != ACL_OK) {
+            char *reason;
+            switch (acl_retval) {
+            case ACL_DENIED_CMD:
+                reason = "no permission to execute the command or subcommand";
+                break;
+            case ACL_DENIED_KEY:
+                reason = "no permission to touch the specified keys";
+                break;
+            case ACL_DENIED_CHANNEL:
+                reason = "no permission to access one of the channels used "
+                         "as arguments";
+                break;
+            default:
+                reason = "no permission";
+                break;
+            }
+            addACLLogEntry(c,acl_retval,acl_errpos,NULL);
+            addReplyErrorFormat(c,
+                "-NOPERM ACLs rules changed between the moment the "
+                "transaction was accumulated and the EXEC call. "
+                "This command is no longer allowed for the "
+                "following reason: %s", reason);
+        } else {
+            // 执行
+            call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
+            serverAssert((c->flags & CLIENT_BLOCKED) == 0);
+        }
+
+        /* Commands may alter argc/argv, restore mstate. */
+        c->mstate.commands[j].argc = c->argc;
+        c->mstate.commands[j].argv = c->argv;
+        c->mstate.commands[j].cmd = c->cmd;
+    }
+
+    // restore old DENY_BLOCKING value
+    if (!(old_flags & CLIENT_DENY_BLOCKING))
+        c->flags &= ~CLIENT_DENY_BLOCKING;
+
+    c->argv = orig_argv;
+    c->argc = orig_argc;
+    c->cmd = orig_cmd;
+    // 释放client事务相关的所有变量
+    discardTransaction(c);
+
+    /* Make sure the EXEC command will be propagated as well if MULTI
+     * was already propagated. */
+    if (server.propagate_in_transaction) {
+        int is_master = server.masterhost == NULL;
+        server.dirty++;
+        /* 这点没看太懂，后面主从再分析 */
+        if (server.repl_backlog && was_master && !is_master) {
+            char *execcmd = "*1\r\n$4\r\nEXEC\r\n";
+            feedReplicationBacklog(execcmd,strlen(execcmd));
+        }
+        afterPropagateExec();
+    }
+
+    server.in_exec = 0;
+
+handle_monitor:
+    /* 后面分析 */
+    if (listLength(server.monitors) && !server.loading)
+        replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
+}
+```
+从上面看到，如果watch的key改变或者命令错误，所有事务命令都不执行，但是如果数据错误，事务依然会执行所有命令。以上就是redis的watch和事务
