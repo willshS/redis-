@@ -3,22 +3,22 @@
 redisdb是redis存储数据的模型。redis默认有16个db，可以进行配置。
 ```
 typedef struct redisDb {
-    dict *dict;                 /* The keyspace for this DB */
-    dict *expires;              /* Timeout of keys with a timeout set */
-    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
-    dict *ready_keys;           /* Blocked keys that received a PUSH */
-    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    dict *dict;                 /* k-v */
+    dict *expires;              /* k-when */
+    dict *blocking_keys;        /* k-client list*/
+    dict *ready_keys;           /* k-null*/
+    dict *watched_keys;         /* k-client list */
     int id;                     /* Database ID */
     long long avg_ttl;          /* Average TTL, just for stats */
     unsigned long expires_cursor; /* Cursor of the active expire cycle. */
-    list *defrag_later;         /* List of key names to attempt to defrag one by one, gradually. */
+    list *defrag_later;         /* redis6.2.3 好像未启用 */
 } redisDb;
 ```
 `dict` 主键哈希表，key-value都存储在这里。  
-`expires` 有过期设置的key  
-`blocking_keys` 阻塞键  
-`ready_keys` 阻塞就绪键  
-`watched_keys`  
+`expires` 有过期设置的key value是过期时间   
+`blocking_keys` 阻塞键 value是等待这个key的client链表  
+`ready_keys` 阻塞就绪键 value是NULL  
+`watched_keys` 监听key value是监听这个key的client链表  
 `id` id  
 
 ### 初始化
@@ -99,6 +99,36 @@ void genericSetKey(client *c, redisDb *db, robj *key, robj *val, int keepttl, in
     if (!keepttl) removeExpire(db,key);
     // 通知此key变化了
     if (signal) signalModifiedKey(c,db,key);
+}
+
+robj *lookupKeyWriteWithFlags(redisDb *db, robj *key, int flags) {
+    expireIfNeeded(db,key);
+    return lookupKey(db,key,flags);
+}
+
+int expireIfNeeded(redisDb *db, robj *key) {
+    if (!keyIsExpired(db,key)) return 0;
+
+    // 如果过期了，但是不是master，直接返回过期。不进行删除，等master给消息
+    if (server.masterhost != NULL) return 1;
+
+    if (checkClientPauseTimeoutAndReturnIfPaused()) return 1;
+
+    /* Delete the key */
+    if (server.lazyfree_lazy_expire) {
+        // 异步删除，计算value的大小，如果大于阈值，value在后台bio线程删除。key直接删除
+        dbAsyncDelete(db,key);
+    } else {
+        // 直接释放key-value
+        dbSyncDelete(db,key);
+    }
+    server.stat_expiredkeys++;
+    // 通知从删除，并写入aof
+    propagateExpire(db,key,server.lazyfree_lazy_expire);
+    notifyKeyspaceEvent(NOTIFY_EXPIRED,
+        "expired",key,db->id);
+    signalModifiedKey(NULL,db,key);
+    return 1;
 }
 
 void dbAdd(redisDb *db, robj *key, robj *val) {
@@ -592,3 +622,169 @@ handle_monitor:
 }
 ```
 从上面看到，如果watch的key改变或者命令错误，所有事务命令都不执行，但是如果数据错误，事务依然会执行所有命令。以上就是redis的watch和事务
+#### expire
+上面db->expire讲到，存储的是有过期时间的key。查找某个key的时候，会判断是否过期，如果过期就删除，如果有一个key有过期时间，但是再也没有访问过，那么redis会主动管理删除。
+```
+void activeExpireCycle(int type) {
+    unsigned long
+    // 根据配置
+    effort = server.active_expire_effort-1,
+    // 一次循环检查多少个key
+    config_keys_per_loop = ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP +
+                           ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP/4*effort,
+    config_cycle_fast_duration = ACTIVE_EXPIRE_CYCLE_FAST_DURATION +
+                                 ACTIVE_EXPIRE_CYCLE_FAST_DURATION/4*effort,
+    config_cycle_slow_time_perc = ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC +
+                                  2*effort,
+    config_cycle_acceptable_stale = ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE-
+                                    effort;
+
+    // 3个全局变量
+    static unsigned int current_db = 0; /* Next DB to test. */
+    static int timelimit_exit = 0;      /* Time limit hit in previous call? */
+    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
+
+    int j, iteration = 0;
+    int dbs_per_call = CRON_DBS_PER_CALL;
+    long long start = ustime(), timelimit, elapsed;
+
+    if (checkClientPauseTimeoutAndReturnIfPaused()) return;
+
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
+        // 上一个循环不是因为时间过期退出的，并且过期key的比率不高于配置的
+        if (!timelimit_exit &&
+            server.stat_expired_stale_perc < config_cycle_acceptable_stale)
+            return;
+        // 上次循环过期没多久，再攒攒
+        if (start < last_fast_cycle + (long long)config_cycle_fast_duration*2)
+            return;
+
+        last_fast_cycle = start;
+    }
+
+    // 每次检查的db数量不能超过总数，如果上次循环是因为时间过期，这次全扫描
+    if (dbs_per_call > server.dbnum || timelimit_exit)
+        dbs_per_call = server.dbnum;
+
+    // 计算每次循环用的最多的时间
+    timelimit = config_cycle_slow_time_perc*1000000/server.hz/100;
+    timelimit_exit = 0;
+    if (timelimit <= 0) timelimit = 1;
+
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        timelimit = config_cycle_fast_duration; /* in microseconds. */
+
+    long total_sampled = 0;
+    long total_expired = 0;
+
+    // 多个db的循环
+    for (j = 0; j < dbs_per_call && timelimit_exit == 0; j++) {
+        unsigned long expired, sampled;
+
+        // 取当前的db
+        redisDb *db = server.db+(current_db % server.dbnum);
+        current_db++;
+
+        do {
+            unsigned long num, slots;
+            long long now, ttl_sum;
+            int ttl_samples;
+            iteration++;
+
+            // 这个db没有过期key，直接下一个db
+            if ((num = dictSize(db->expires)) == 0) {
+                db->avg_ttl = 0;
+                break;
+            }
+            // 过期db有多少桶
+            slots = dictSlots(db->expires);
+            now = mstime();
+
+            // 过期db里面数据小于百分之1
+            if (slots > DICT_HT_INITIAL_SIZE &&
+                (num*100/slots < 1)) break;
+
+            // 删除过期key的数量  取样数量
+            expired = 0;
+            sampled = 0;
+            ttl_sum = 0;
+            ttl_samples = 0;
+
+            if (num > config_keys_per_loop)
+                num = config_keys_per_loop;
+
+            // 如果空桶特别多，最多检查应该检查的key数量*20个空桶
+            long max_buckets = num*20;
+            long checked_buckets = 0;
+
+            while (sampled < num && checked_buckets < max_buckets) {
+                // 取哈希表两个table的expires_cursor
+                for (int table = 0; table < 2; table++) {
+                    if (table == 1 && !dictIsRehashing(db->expires)) break;
+
+                    unsigned long idx = db->expires_cursor;
+                    idx &= db->expires->ht[table].sizemask;
+                    dictEntry *de = db->expires->ht[table].table[idx];
+                    long long ttl;
+
+                    while(de) {
+                        // 遍历这个桶
+                        dictEntry *e = de;
+                        de = de->next;
+
+                        ttl = dictGetSignedIntegerVal(e)-now;
+                        // 过期就删除
+                        if (activeExpireCycleTryExpire(db,e,now)) expired++;
+                        if (ttl > 0) {
+                            ttl_sum += ttl;
+                            ttl_samples++;
+                        }
+                        sampled++;
+                    }
+                }
+                // 继续下一个桶
+                db->expires_cursor++;
+            }
+            total_expired += expired;
+            total_sampled += sampled;
+
+            // 计算db中过期key的平均ttl。权重平均
+            if (ttl_samples) {
+                long long avg_ttl = ttl_sum/ttl_samples;
+
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
+            }
+
+            // 每16次遍历 检查是否到时间限制了
+            if ((iteration & 0xf) == 0) { /* check once every 16 iterations. */
+                elapsed = ustime()-start;
+                if (elapsed > timelimit) {
+                    timelimit_exit = 1;
+                    server.stat_expired_time_cap_reached_count++;
+                    break;
+                }
+            }
+            // 如果当前db空桶过多或者过期率太高，继续这个db
+        } while (sampled == 0 ||
+                 (expired*100/sampled) > config_cycle_acceptable_stale);
+    }
+
+    elapsed = ustime()-start;
+    server.stat_expire_cycle_time_used += elapsed;
+    latencyAddSampleIfNeeded("expire-cycle",elapsed/1000);
+
+    // 算一下整个过程过期key的比率
+    double current_perc;
+    if (total_sampled) {
+        current_perc = (double)total_expired/total_sampled;
+    } else
+        current_perc = 0;
+    server.stat_expired_stale_perc = (current_perc*0.05)+
+                                     (server.stat_expired_stale_perc*0.95);
+}
+```
+整个过程其实就是遍历db->expire哈希表来判断key是否过期。中间增加了很多条件来达成此函数不会占用过多的cpu，并且尽可能的达到用户配置的过期比率。此函数会在beforeSleep调用快速过程，在serverCron时间事件中调用slowtype的过程。
+
+## 总结
+redisdb主要结构为哈希表，因此查找速度极快，保证了redis的性能。上面介绍了主要db的使用方式，顺带介绍了普通命令，阻塞命令，事务，过期key处理等重点。
