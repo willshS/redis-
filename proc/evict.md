@@ -214,7 +214,7 @@ int performEvictions(void) {
 
 cant_free:
     if (result == EVICT_FAIL) {
-        // 跑到这里可能是异步删除，这里sleep一下，然后检查一下内存结果
+        // 跑到这里可能是异步删除。如果后台线程删除作业还有，这里sleep一下，然后检查一下内存结果
         if (bioPendingJobsOfType(BIO_LAZY_FREE)) {
             usleep(eviction_time_limit_us);
             if (getMaxmemoryState(NULL,NULL,NULL,NULL) == C_OK) {
