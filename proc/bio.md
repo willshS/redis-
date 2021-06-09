@@ -76,6 +76,7 @@ void *bioProcessBackgroundJobs(void *arg) {
             // close系统调用就完事了
             close(job->fd);
         } else if (type == BIO_AOF_FSYNC) {
+            // 调用fsync 刷数据到磁盘
             // fd可能被关了，被主线程拿来用作其它用途，忽略这些错误，aof并不会真正的失败
             if (redis_fsync(job->fd) == -1 &&
                 errno != EBADF && errno != EINVAL)
@@ -145,4 +146,4 @@ unsigned long long bioWaitStepOfType(int type) {
 }
 ```
 ## 总结
-bio是非常简单的后台线程，每个线程有一个自己的作业队列，没有作业久等新作业，有作业久做作业，做完一个作业通知一下就可以了。不支持通知作业的创建者做完作业了（bioPendingJobsOfType太粗糙了，作业队列那么多，你不知道是不是你创建的作业被完成了，当然，可以通过作业列表的数量来查看）。redis后台线程主要是关闭文件io和释放内存，关闭文件系统调用速度比较慢，可能会导致服务卡，future可能会使用libeio
+bio是非常简单的后台线程，每个线程有一个自己的作业队列，没有作业久等新作业，有作业久做作业，做完一个作业通知一下就可以了。不支持通知作业的创建者做完作业了（bioPendingJobsOfType太粗糙了，作业队列那么多，你不知道是不是你创建的作业被完成了，当然，可以通过作业列表的数量来查看）。redis后台线程主要是关闭文件io，刷数据到磁盘和释放内存，关闭文件系统调用速度比较慢，可能会导致服务卡，future可能会使用libeio
