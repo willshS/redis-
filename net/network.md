@@ -88,10 +88,9 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             int fd = eventLoop->fired[j].fd;
             int fired = 0; /* Number of events fired for current fd. */
 
-            //有AE_BARRIER先处理写再处理读，官方解释为如果在多路复用前钩子函数中有刷盘行为，这样处理非常有用。暂时不知道为什么
+            //有AE_BARRIER先处理写再处理读，官方解释为如果在多路复用前钩子函数中有刷盘行为，这样处理非常有用。cow，读请求可能有申请内存的，刷盘的时候是子进程刷盘，因此内存保持不变可以使用cow。（父进程fork的子进程与父进程共享内存，仅仅是虚拟内存不同，页表中指向的物理地址是相同的，如果内存被修改，发生页中断，才会拷贝一份，这样父子进程都独有了，这就是copy on write，在写的时候再去copy）所以先处理写请求，往外发送数据不会修改内存，处理完可能刷盘刷完了，再来处理读请求
             int invert = fe->mask & AE_BARRIER;
 
-            //todo：检查fe中的mask是否还有读
             //处理读事件
             if (!invert && fe->mask & mask & AE_READABLE) {
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
@@ -173,7 +172,7 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
     return AE_OK;
 }
 ```
-我们从监听socket开始看文件事件模型，首先redis根据配置监听端口（bind、listen、设置非阻塞属性等）调用`createSocketAcceptHandler`创建文件事件注册读取回调函数`acceptTcpHandler`，处理客户端tcp连接，在有socket链接上来调用注册的`acceptTcpHandler`回调函数获取fd，使用fd创建一个[connection](#connection)的结构体（其实有cpp对象的味道），然后创建client结构体（todo：client），`connection`结构体中有读取回调，写回调等，设置回调函数就会生成fileEvent注册到事件循环中，当事件发生就会调用对应的回调函数，例如redis-cli链接上来，生成client对象会设置`connection`的读取回调，注册回调函数`readQueryFromClient`，当有读取事件发生，将会调用`readQueryFromClient`函数进行处理。
+我们从监听socket开始看文件事件模型，首先redis根据配置监听端口（bind、listen、设置非阻塞属性等）调用`createSocketAcceptHandler`创建文件事件注册读取回调函数`acceptTcpHandler`，处理客户端tcp连接，在有socket链接上来调用注册的`acceptTcpHandler`回调函数获取fd，使用fd创建一个[connection](#connection)的结构体（其实有cpp对象的味道），然后创建client结构体，`connection`结构体中有读取回调，写回调等，设置回调函数就会生成fileEvent注册到事件循环中，当事件发生就会调用对应的回调函数，例如redis-cli链接上来，生成client对象会设置`connection`的读取回调，注册回调函数`readQueryFromClient`，当有读取事件发生，将会调用`readQueryFromClient`函数进行处理。
 ## 时间事件
 时间事件与文件事件比较类似
 ```

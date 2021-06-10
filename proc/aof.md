@@ -115,7 +115,7 @@ void flushAppendOnlyFile(int force) {
      * While this will save us against the server being killed I don't think
      * there is much to do about the whole server stopping for power problems
      * or alike */
-    // 测试用的 根据注释 为了保证写入物理块的时候的原子性？todo
+    // 测试用的 根据注释 大概就是我们在写之前休眠一下，让操作系统有时间将前面写的数据刷到磁盘上，这样即便系统异常（断电），可尽可能多的保证数据落盘，而我们等着系统刷aof_buf数据不就全丢了？如果这时候系统异常，aof_buf即便调用了写也没时间落盘。
     if (server.aof_flush_sleep && sdslen(server.aof_buf)) {
         usleep(server.aof_flush_sleep);
     }
@@ -371,7 +371,8 @@ int rewriteAppendOnlyFile(char *filename) {
         bytes_to_write -= chunk_size;
         buf += chunk_size;
 
-        // copy on write 相关 没看懂
+        // 父进程在子进程生命周期中传过来的数据一定是copy的，这个copy操作非常费时费力。
+        // 子进程每次写8M，统计时间和cow的内存数发给父进程。不过从代码来看父进程完全不care
         long long now = mstime();
         if (now - cow_updated_time >= 1000) {
             sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_count, "AOF rewrite");
@@ -405,7 +406,7 @@ werr:
     return C_ERR;
 }
 ```
-以上为重写aof文件的流程。copy on write没搞懂todo。  
+以上为重写aof文件的流程。  
 最后还有子进程结束后父进程监听到后进行的收尾工作，比如在子进程进行重写的时候，父进程先将diff数据放入rewritebuf，然后才写入pipe，子进程结束后，rewritebuf可能又有数据了，写入新文件，然后将新文件改成配置文件中的aof文件的名字，以接收下面的新命令追加。这些就不详细解释了，都很好理解。
 ## 总结
 aof是redis的持久化的方式之一，它是通过将用户命令追加到文件，还原通过读取aof文件，按顺序执行其中的每一条命令来进行还原。重写过程中的各种边界条件都要考虑到，任何数据都不能丢，要重新写入新的aof文件中，并且对于系统调用，redis想办法加快或使用子线程来做。
