@@ -55,7 +55,7 @@ unsigned long LFUDecrAndReturn(robj *o) {
 ```
 16位分钟可以表示65536-1分钟。 此函数根据配置的lfu-decay-time 来计算需要减少的数  
 1. 首先算当前时间与对象存储的时间差，若当前时间小于记录的则算一轮即65535-robj->lfu+now。  
-2. 根据时间差除以lfu-decay-time衰减时间等于周期，counter减去周期即可。todo：如果配置为0则不减？（官方注释：A special value of 0 means to decay the counter every time it happens to be scanned. 但是未看到减小。。）
+2. 根据时间差除以lfu-decay-time衰减时间等于周期，counter减去周期即可。如果配置为0则不减。最近最少使用可以通过lfu-decay-time配置周期，比如一个key，他在0-10m使用了100次，但是10m-50m没有任何使用，如果配置为0，则相当于从0-50m这个时间段的counter，如果不为0，则根据时间计算一个衰减的counter = counter - (50m-10m)/lfu-decay-time。这样越久远的它的counter就越少。
 
 ```
 // lfu 增加
