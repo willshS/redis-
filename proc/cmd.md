@@ -141,3 +141,4 @@ void dbAdd(redisDb *db, robj *key, robj *val) {
     if (server.cluster_enabled) slotToKeyAdd(key->ptr);
 }
 ```
+***command命令在[db](../model/redisdb.md)有介绍，还有pubsub，stream等，因为command太杂乱了，此文件不再更新***
