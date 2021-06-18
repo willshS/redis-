@@ -612,3 +612,4 @@ sentinelRedisInstance *sentinelSelectSlave(sentinelRedisInstance *master) {
 6. 给选出来的slave发送SLAVEOF提升到主服务器。之后给所有其它的从服务器也发送slaveof让从服务器复制新的master。最后其它sentinel的信息修改是通过INFO命令获取新的master的slaves
 ## 总结
 以上总结了redis哨兵的主要机制，有很多细节并没有介绍。redis的哨兵机制是通过哨兵对主从服务器的监控，并周期性的更新信息保证哨兵信息一致，哨兵机制让redis有了高可用的属性！
+建议使用前阅读官方文档：https://redis.io/topics/sentinel
